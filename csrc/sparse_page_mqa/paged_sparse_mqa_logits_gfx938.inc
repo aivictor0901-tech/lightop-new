@@ -290,7 +290,7 @@ __device__ __forceinline__ float head_sum(const floatx4 (&acc)[HT], const float 
 // and normalize the four channel groups before their FP32 sum. This avoids
 // overflow in separately decoded operands and uses no FP64 instructions.
 template<bool FP4>
-__device__ __attribute__((noinline)) float exceptional_score(
+__device__ __forceinline__ float exceptional_score_inline(
     const Args& a, int r, int group, const uint8_t* kp, unsigned ks, bool live) {
     float s0 = 0.f, s1 = 0.f;
     for (int h = 0; h < a.heads; ++h) {
@@ -340,6 +340,13 @@ __device__ __attribute__((noinline)) float exceptional_score(
     sum += __shfl_xor(sum, 16, 64);
     sum += __shfl_xor(sum, 32, 64);
     return sum;
+}
+
+// Preserve the legacy call boundary for decode and large-row fallback kernels.
+template<bool FP4>
+__device__ __attribute__((noinline)) float exceptional_score(
+    const Args& a, int r, int group, const uint8_t* kp, unsigned ks, bool live) {
+    return exceptional_score_inline<FP4>(a, r, group, kp, ks, live);
 }
 
 // One same-stream setup launch owns output and all fresh private fill buffers.
@@ -1047,7 +1054,7 @@ __global__ void sparse_fp8_fp4_paged_mqa_logits__prefill_paged_sparse_logits(Arg
     }
 }
 
-template<bool FP4, int HT, int BlockKV, bool FallbackOnly, bool FP8Only = false, bool BF16Only = false, bool FixedLayout = false, bool Predecoded = false, bool CommonSafe = false, bool OverflowOnly = false, bool Interleaved = false, bool WholeBlocks = false, bool UnionFallbackOnly = false, bool ImmediateExceptional = false>
+template<bool FP4, int HT, int BlockKV, bool FallbackOnly, bool FP8Only = false, bool BF16Only = false, bool FixedLayout = false, bool Predecoded = false, bool CommonSafe = false, bool OverflowOnly = false, bool Interleaved = false, bool WholeBlocks = false, bool UnionFallbackOnly = false, bool ImmediateExceptional = false, bool SplitParallel = false>
 __device__ __forceinline__ void prefill_paged_sparse_logits_body(Args a) {
     if constexpr (OverflowOnly) {
         if (*a.fp8_invalid == 0) return;
@@ -1104,9 +1111,10 @@ __device__ __forceinline__ void prefill_paged_sparse_logits_body(Args a) {
     const uint8_t* splits = a.metadata + sizeof(MetadataHeader);
     const auto* schedule = reinterpret_cast<const ScheduleEntry*>(
         splits + static_cast<int64_t>(header->num_kv_splits) * SplitBytes);
-    const int64_t entries = static_cast<int64_t>(header->num_waves) * a.num_sms;
+    const int64_t schedule_entries = static_cast<int64_t>(header->num_waves) * a.num_sms;
+    const int64_t entries = SplitParallel ? header->num_kv_splits : schedule_entries;
     SPARSE_DEVICE_CHECK(sizeof(MetadataHeader) + static_cast<int64_t>(header->num_kv_splits) * SplitBytes +
-           entries * sizeof(ScheduleEntry) <= a.metadata_bytes);
+           schedule_entries * sizeof(ScheduleEntry) <= a.metadata_bytes);
     const int wave = threadIdx.x / 64, lane = threadIdx.x % 64;
     const int pos = lane % 16, group = lane / 16;
     // C003: named rows and accumulators avoid dynamic indexing of large
@@ -1114,8 +1122,19 @@ __device__ __forceinline__ void prefill_paged_sparse_logits_body(Args a) {
     RowQ<FP4,HT,CommonSafe> q0, q1;
     // More independent CTAs can consume the many Prefill entries. No host
     // read of num_waves is needed, and the producer's schedule width is kept.
+    // Bounded replay has too few schedule entries to fill the device. A
+    // short-row consumer assigns independent CTAs to the existing KV splits,
+    // retaining the producer's physical blocks, pair ownership and slot IDs.
     for (int64_t entry_idx = blockIdx.x; entry_idx < entries; entry_idx += gridDim.x) {
-        const ScheduleEntry entry = schedule[entry_idx];
+        ScheduleEntry entry;
+        if constexpr (SplitParallel) {
+            const auto* split = reinterpret_cast<const KVSplitHeader*>(
+                splits + entry_idx * SplitBytes);
+            entry = {static_cast<uint32_t>(entry_idx), static_cast<uint32_t>(entry_idx + 1),
+                     split->q_token_base, split->q1_slot_base == 0xffffffffu ? 1u : 2u};
+        } else {
+            entry = schedule[entry_idx];
+        }
         if (entry.num_q_tokens == 0) {
             SPARSE_DEVICE_CHECK(entry.kv_split_begin == entry.kv_split_end);
             continue;
@@ -1392,7 +1411,10 @@ __device__ __forceinline__ void prefill_paged_sparse_logits_body(Args a) {
                                 // lane participates in exceptional_score's
                                 // cross-group shuffles; live masks its dot only.
                                 if (!plan.normal) {
-                                    logit = exceptional_score<FP4>(a, r+i, group, tile.payload, sf, tile.valid[i]);
+                                    if constexpr (SplitParallel)
+                                        logit = exceptional_score_inline<FP4>(a, r+i, group, tile.payload, sf, tile.valid[i]);
+                                    else
+                                        logit = exceptional_score<FP4>(a, r+i, group, tile.payload, sf, tile.valid[i]);
                                 } else {
                                     if (!q.safe_weight) {
 #pragma unroll
@@ -1424,6 +1446,14 @@ __device__ __forceinline__ void prefill_paged_sparse_logits_body(Args a) {
             }
         }
     }
+}
+
+// All arithmetic paths remain in one short-row launch. Inlining the cold
+// normalized FP32 path avoids its private call frame on ordinary MMAC work.
+__attribute__((amdgpu_flat_work_group_size(128,128)))
+__global__ void sparse_fp8_fp4_paged_mqa_logits__prefill_small_split(Args a) {
+    prefill_paged_sparse_logits_body<true,2,8,false,false,false,true,
+        false,false,false,false,false,false,true,true>(a);
 }
 
 // Eligible fixed-layout Prefill only. Q/K prep and remap have finished
@@ -3704,6 +3734,13 @@ torch::Tensor fp8_fp4_paged_sparse_mqa_logits(
         }
     }
     make_metadata(false);
+    if (is_prefill && fixed_prefill_layout && rows <= 32 &&
+        (arch.rfind("gfx936",0) == 0 || arch.rfind("gfx938",0) == 0)) {
+        sparse_fp8_fp4_paged_mqa_logits__prefill_small_split<<<
+            static_cast<unsigned>(max_splits),128,0,stream>>>(a);
+        TORCH_CHECK(hipGetLastError() == hipSuccess, "small-query split consumer failed");
+        return out;
+    }
 #define PREFILL_CALL(FP4,HT,BLOCK,FALLBACK,FP8,BF16) do { \
     if constexpr (FP4 && HT == 2 && BLOCK == 8) { \
         if (fixed_prefill_layout) { \

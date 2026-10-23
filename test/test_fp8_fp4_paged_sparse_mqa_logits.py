@@ -170,6 +170,15 @@ def case_matrix():
                 context=65539,
             )
         )
+    # Decoder bounded replay retains the final 128 global queries. CP8
+    # interleave therefore supplies 16 rows/rank, independently of KV context.
+    for context in (4096, 16384, 32768, 65536, 131072, 262144, 524288):
+        for overlap in ("full", "partial"):
+            result.append(Case(
+                f"bounded-cp8-{context}-{overlap}", rows=16, capacity=2048,
+                context=context, layout="packed", overlap=overlap, causal=True,
+                benchmark=True, one_shot=True, cp_world=8, prefix=context-128,
+            ))
     return result
 
 
