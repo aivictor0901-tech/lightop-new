@@ -21,6 +21,7 @@ if use_lightop:
 # from lightop import op as lightop_op
 from ...op import rms_norm_dynamic_per_token_quant
 from ... import op as lightop_native
+from ...qwen38_i8_padding import maybe_run as qwen38_i8_padding_maybe_run
 from ...fuse_silu_mul_quant import fuse_silu_mul_quant
 
 
@@ -713,6 +714,11 @@ def blaslt_w8a8_bf16_gemm_wrapper(a : torch.Tensor,
     ) -> None:
     alpha = torch.tensor(1, dtype=torch.int32, device='cpu')
     beta = torch.tensor(0, dtype=torch.int32, device='cpu')
+    if qwen38_i8_padding_maybe_run(
+        b, a, scale_b, scale_a, d, m, n, k, batch, transpose_flag, bias,
+        lightop_native._lmslimquant_blaslt_w8a8_bf16_gemm, alpha, beta,
+    ):
+        return
     lightop_native._lmslimquant_blaslt_w8a8_bf16_gemm(
         a, b, scale_a, scale_b, d, m, n, k, batch, transpose_flag, alpha, beta, bias
     )
