@@ -18,28 +18,28 @@ namespace {
 
 constexpr int kWorkspaceThreads = 256;
 
-__global__ void dsv4_mark_topk_rows(
-    int32_t* hits, const int32_t* indices, const int32_t* lengths,
-    int64_t stride, int64_t width, int64_t num_compressed) {
+__global__ void dsv4_mark_topk_rows(int32_t *hits, const int32_t *indices,
+                                    const int32_t *lengths, int64_t stride,
+                                    int64_t width, int64_t num_compressed) {
   const int64_t query = blockIdx.x;
   const int64_t length = lengths[query];
-  for (int64_t column = threadIdx.x; column < width;
-       column += blockDim.x) {
+  for (int64_t column = threadIdx.x; column < width; column += blockDim.x) {
     if (column < length) {
       const int64_t row = indices[query * stride + column];
       if (row >= 0 && row < num_compressed) {
-        atomicOr(reinterpret_cast<unsigned int*>(hits + row), 1u);
+        atomicOr(reinterpret_cast<unsigned int *>(hits + row), 1u);
       }
     }
   }
 }
 
 template <typename index_t>
-__global__ void dsv4_pack_topk_rows(
-    const index_t* full_ids, const int32_t* hits, const int32_t* prefix,
-    int32_t* packed, int64_t num_compressed, int64_t capacity) {
-  const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x +
-      threadIdx.x;
+__global__ void dsv4_pack_topk_rows(const index_t *full_ids,
+                                    const int32_t *hits, const int32_t *prefix,
+                                    int32_t *packed, int64_t num_compressed,
+                                    int64_t capacity) {
+  const int64_t row =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (row < num_compressed && hits[row] != 0) {
     const int64_t rank = static_cast<int64_t>(prefix[row]) - 1;
     if (rank >= 0 && rank < capacity) {
@@ -48,33 +48,40 @@ __global__ void dsv4_pack_topk_rows(
   }
 }
 
-__global__ void dsv4_remap_topk_rows(
-    int32_t* output, const int32_t* indices, const int32_t* lengths,
-    const int32_t* prefix, int64_t stride, int64_t width,
-    int64_t num_compressed, int64_t capacity) {
+__global__ void dsv4_remap_topk_rows(int32_t *output, const int32_t *indices,
+                                     const int32_t *lengths,
+                                     const int32_t *prefix, int64_t stride,
+                                     int64_t width, int64_t num_compressed,
+                                     int64_t capacity, int64_t swa_rows) {
   const int64_t query = blockIdx.x;
   const int64_t length = lengths[query];
-  for (int64_t column = threadIdx.x; column < width;
-       column += blockDim.x) {
+  for (int64_t column = threadIdx.x; column < width; column += blockDim.x) {
     int32_t result = -1;
     if (column < length) {
       const int64_t row = indices[query * stride + column];
       if (row >= 0 && row < num_compressed) {
         const int64_t rank = static_cast<int64_t>(prefix[row]) - 1;
-        if (rank >= 0 && rank < capacity) result = static_cast<int32_t>(rank);
-      } else if (row >= num_compressed) {
-        result = static_cast<int32_t>(row - num_compressed + capacity);
+        if (rank >= 0 && rank < capacity)
+          result = static_cast<int32_t>(rank);
+      } else if (row >= num_compressed &&
+                 (swa_rows < 0 || row - num_compressed < swa_rows)) {
+        const int64_t rebased = row - num_compressed + capacity;
+        if (rebased <= std::numeric_limits<int32_t>::max()) {
+          result = static_cast<int32_t>(rebased);
+        }
       }
     }
     output[query * width + column] = result;
   }
 }
 
-}  // namespace
+} // namespace
 
-std::vector<torch::Tensor> dsv4_pack_c4_topk_workspace(
-    const torch::Tensor& full_ids, const torch::Tensor& indices,
-    const torch::Tensor& lengths, int64_t topk, int64_t capacity) {
+std::vector<torch::Tensor>
+dsv4_pack_sparse_topk_workspace(const torch::Tensor &full_ids,
+                                const torch::Tensor &indices,
+                                const torch::Tensor &lengths, int64_t topk,
+                                int64_t capacity, int64_t swa_rows) {
   TORCH_CHECK(full_ids.is_cuda() && indices.is_cuda() && lengths.is_cuda(),
               "C4 TopK workspace inputs must be GPU tensors");
   TORCH_CHECK(full_ids.device() == indices.device() &&
@@ -100,6 +107,9 @@ std::vector<torch::Tensor> dsv4_pack_c4_topk_workspace(
               "C4 TopK workspace geometry is outside the supported range");
   TORCH_CHECK(capacity >= std::min(n, queries * topk) && capacity <= n,
               "C4 TopK workspace capacity is not a safe union bound");
+  TORCH_CHECK(swa_rows >= -1 &&
+                  (swa_rows == -1 || swa_rows <= max_int - capacity),
+              "compressed capacity plus SWA rows exceeds int32 indices");
 
   const c10::cuda::CUDAGuard device_guard(full_ids.device());
   const auto stream = at::cuda::getCurrentCUDAStream();
@@ -113,7 +123,9 @@ std::vector<torch::Tensor> dsv4_pack_c4_topk_workspace(
   // The union count stays on the current GPU stream. No host readback or
   // data-dependent allocation is needed; capacity is a caller-known bound.
   auto prefix = at::cumsum(hits, 0, at::kInt);
-  auto count = prefix.slice(0, n - 1, n);
+  // A one-element view would retain the entire N-row scan through Attention.
+  // Clone only the GPU count; no host readback or synchronization is needed.
+  auto count = prefix.slice(0, n - 1, n).clone();
   auto packed = at::full({capacity}, -1, options);
   const int64_t blocks = (n + kWorkspaceThreads - 1) / kWorkspaceThreads;
   if (full_ids.scalar_type() == at::kLong) {
@@ -130,10 +142,17 @@ std::vector<torch::Tensor> dsv4_pack_c4_topk_workspace(
   dsv4_remap_topk_rows<<<queries, kWorkspaceThreads, 0, stream>>>(
       remapped.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
       lengths.data_ptr<int32_t>(), prefix.data_ptr<int32_t>(),
-      indices.stride(0), width, n, capacity);
+      indices.stride(0), width, n, capacity, swa_rows);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {packed, remapped, count};
 }
 
-}  // namespace native
-}  // namespace at
+std::vector<torch::Tensor> dsv4_pack_c4_topk_workspace(
+    const torch::Tensor &full_ids, const torch::Tensor &indices,
+    const torch::Tensor &lengths, int64_t topk, int64_t capacity) {
+  return dsv4_pack_sparse_topk_workspace(full_ids, indices, lengths, topk,
+                                         capacity, /*swa_rows=*/-1);
+}
+
+} // namespace native
+} // namespace at

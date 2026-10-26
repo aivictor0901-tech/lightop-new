@@ -4,7 +4,8 @@
 #include <torch/extension.h>
 
 #if (defined(LIGHTOP_MHC_REPEAT_CP_ONLY) + defined(LIGHTOP_CP_OUTPUT_ONLY) + \
-     defined(LIGHTOP_SPARSE_MQA_ONLY) + defined(LIGHTOP_PREFILL_FUSION_ONLY)) > 1
+     defined(LIGHTOP_SPARSE_MQA_ONLY) + defined(LIGHTOP_PREFILL_FUSION_ONLY) + \
+     defined(LIGHTOP_TOPK_WORKSPACE_ONLY)) > 1
 #error "Select only one focused LightOp extension"
 #endif
 
@@ -42,6 +43,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              py::arg("gathered"), py::arg("cp_size"), py::arg("cycle_leaders"));
   module.def("make_interleave_plan_", &lightop::cp_output::make_interleave_plan_,
              py::arg("cycle_leaders"), py::arg("rows"), py::arg("cp_size"));
+}
+
+#elif defined(LIGHTOP_TOPK_WORKSPACE_ONLY)
+namespace at::native {
+void dequantize_k_cache_paged_hcu_counted(
+    const torch::Tensor&, const torch::Tensor&, torch::Tensor&,
+    int64_t, bool, const torch::Tensor&);
+std::vector<torch::Tensor> dsv4_pack_sparse_topk_workspace(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    int64_t, int64_t, int64_t);
+std::vector<torch::Tensor> dsv4_pack_c4_topk_workspace(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    int64_t, int64_t);
+}  // namespace at::native
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("dequantize_k_cache_paged_hcu_counted",
+             &at::native::dequantize_k_cache_paged_hcu_counted,
+             py::arg("cache"), py::arg("token_ids"), py::arg("out"),
+             py::arg("page_size"), py::arg("fp8_fnuz"), py::arg("valid_count"));
+  module.def("dsv4_pack_sparse_topk_workspace",
+             &at::native::dsv4_pack_sparse_topk_workspace,
+             py::arg("full_ids"), py::arg("combined_indices"),
+             py::arg("combined_lens"), py::arg("topk"),
+             py::arg("capacity"), py::arg("swa_rows") = -1);
+  module.def("dsv4_pack_c4_topk_workspace",
+             &at::native::dsv4_pack_c4_topk_workspace,
+             py::arg("full_ids"), py::arg("combined_indices"),
+             py::arg("combined_lens"), py::arg("topk"), py::arg("capacity"));
 }
 
 #else
@@ -739,6 +769,12 @@ void combine_topk_swa_indices_hcu(
 std::vector<torch::Tensor> dsv4_pack_c4_topk_workspace(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     int64_t, int64_t);
+void dequantize_k_cache_paged_hcu_counted(
+    const torch::Tensor&, const torch::Tensor&, torch::Tensor&,
+    int64_t, bool, const torch::Tensor&);
+std::vector<torch::Tensor> dsv4_pack_sparse_topk_workspace(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    int64_t, int64_t, int64_t);
 
 void dsv4_dequantize_k_cache_paged_out(
     torch::Tensor const& cache_u8,
@@ -1661,6 +1697,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
      py::arg("reuse_compact_indices") = false);
  m.def("dequantize_k_cache_paged_hcu", &at::native::dequantize_k_cache_paged_hcu,
        "V4 packed paged KV dequantization into preallocated BF16 output");
+ m.def("dequantize_k_cache_paged_hcu_counted",
+       &at::native::dequantize_k_cache_paged_hcu_counted,
+       "Dequantize the GPU-counted valid KV prefix into preallocated BF16 output",
+       py::arg("cache"), py::arg("token_ids"), py::arg("out"),
+       py::arg("page_size"), py::arg("fp8_fnuz"), py::arg("valid_count"));
  m.def("combine_topk_swa_indices_hcu", &at::native::combine_topk_swa_indices_hcu,
        "Combine compressed TopK and positional SWA indices into a flat workspace");
  m.def("dsv4_pack_c4_topk_workspace",
@@ -1668,6 +1709,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "Pack a DSV4 C4 TopK union and remap query indices on GPU",
       py::arg("full_ids"), py::arg("combined_indices"),
       py::arg("combined_lens"), py::arg("topk"), py::arg("capacity"));
+ m.def("dsv4_pack_sparse_topk_workspace",
+      &at::native::dsv4_pack_sparse_topk_workspace,
+      "Pack a C1/C2/C4 TopK union and rebase compressed/SWA indices on GPU",
+      py::arg("full_ids"), py::arg("combined_indices"),
+      py::arg("combined_lens"), py::arg("topk"), py::arg("capacity"),
+      py::arg("swa_rows") = -1);
 m.def(
      "dsv4_dequantize_k_cache_paged_out",
      &at::native::dsv4_dequantize_k_cache_paged_out,
