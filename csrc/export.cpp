@@ -2,6 +2,32 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <torch/extension.h>
+
+#if defined(LIGHTOP_MHC_REPEAT_CP_ONLY)
+namespace at::native {
+bool supports_mhc_repeat_cp_sglang(const torch::Tensor&, int64_t, int64_t,
+                                   int64_t);
+torch::Tensor mhc_repeat_cp_sglang(const torch::Tensor&, int64_t, int64_t,
+                                   int64_t);
+torch::Tensor& mhc_repeat_cp_sglang_out(const torch::Tensor&, int64_t, int64_t,
+                                        int64_t, torch::Tensor&);
+}  // namespace at::native
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.def("supports_mhc_repeat_cp_sglang",
+             &at::native::supports_mhc_repeat_cp_sglang,
+             py::arg("hidden_states"), py::arg("hc_mult"), py::arg("cp_size"),
+             py::arg("cp_rank"));
+  module.def("mhc_repeat_cp_sglang", &at::native::mhc_repeat_cp_sglang,
+             py::arg("hidden_states"), py::arg("hc_mult"), py::arg("cp_size"),
+             py::arg("cp_rank"));
+  module.def("mhc_repeat_cp_sglang_out", &at::native::mhc_repeat_cp_sglang_out,
+             py::arg("hidden_states"), py::arg("hc_mult"), py::arg("cp_size"),
+             py::arg("cp_rank"), py::arg("out"));
+}
+
+#else
+#include <torch/extension.h>
 #include "sparse_page_mqa/prefill_sparse_sort.h"
 #include "sparse_page_mqa/prefill_sparse_fusion.h"
 #include <ATen/ATen.h>
@@ -801,6 +827,9 @@ bool supports_mhc_repeat_cp_sglang(
 torch::Tensor mhc_repeat_cp_sglang(
     const torch::Tensor& hidden_states, int64_t hc_mult,
     int64_t cp_size, int64_t cp_rank);
+torch::Tensor& mhc_repeat_cp_sglang_out(
+    const torch::Tensor& hidden_states, int64_t hc_mult,
+    int64_t cp_size, int64_t cp_rank, torch::Tensor& out);
 void fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_int32(
     Tensor& q,
     const Tensor& kv,
@@ -1622,6 +1651,10 @@ m.def(
  m.def("mhc_repeat_cp_sglang", &at::native::mhc_repeat_cp_sglang,
        "SGLang mHC CP-selected row broadcast",
        py::arg("hidden_states"), py::arg("hc_mult"), py::arg("cp_size"), py::arg("cp_rank"));
+ m.def("mhc_repeat_cp_sglang_out", &at::native::mhc_repeat_cp_sglang_out,
+       "SGLang mHC CP-selected row broadcast into a non-overlapping output",
+       py::arg("hidden_states"), py::arg("hc_mult"), py::arg("cp_size"),
+       py::arg("cp_rank"), py::arg("out"));
  m.def("topk_ids_postprocess",&at::native::topk_ids_postprocess,"topk_ids_postprocess");
  m.def("hc_mix_stats_sinkhorn_bf16x3", &at::native::hc_mix_stats_sinkhorn_bf16x3,
        py::arg("x"), py::arg("weight_parts"), py::arg("scale"), py::arg("base"),
@@ -1702,3 +1735,5 @@ m.def("mimo_v2_split_rope_vscale_kv_store", &at::native::mimo_v2_split_rope_vsca
   m.def("prefill_sparse_sort_candidates", &prefill_sparse_sort_candidates);
   m.def("prefill_sparse_finalize_indices", &prefill_sparse_finalize_indices);
 }
+
+#endif  // focused mHC extension or existing exports
