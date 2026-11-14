@@ -8,6 +8,7 @@ from category_test_runner import run_category
 
 
 RUNNABLE_TEST_FILES = [
+    "test/ci_tests/test_gemma_rms_norm_per_token_int8_quant.py",
     "test/test_norm_existing_api.py",
     "test/test_native_categorized_norm_remaining_api.py",
     "test/test_norm_lm_faster_rmsquant.py",

@@ -576,3 +576,49 @@ def fuse_fill_rms_x2_concat(
     assert(inputs_embeds.shape[-1]<=16384, "inputs_embeds size must be less than 16384")
     op.fuse_fill_rms_x2_concat(hidden_states_fuse,positions, inputs_embeds, previous_hidden_states, weight_inputs_embeds, weight_previous_hidden_states, epsilon)
     return
+
+
+
+def gemma_rms_norm_per_token_int8_quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float = 1e-5,
+    residual: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse FP32 residual addition, Gemma RMSNorm and BF16-rounded INT8 quant.
+
+    ``input`` is a contiguous FP32/BF16 matrix, ``weight`` is FP32 and uses
+    the Gemma ``1 + weight`` convention. The optional residual is FP32.
+    The returned tuple is ``(norm_bf16, quant_int8, scales_fp32, residual_fp32)``.
+    Quantization observes the BF16-rounded norm and uses the same 1e-10
+    absmax floor and nearest-even rounding as ``per_token_quant_int8``.
+
+    Inputs are preserved. With an FP32 input and no residual, the fourth
+    result aliases ``input`` and no redundant residual copy is written.
+    Hidden sizes must be positive multiples of 8 up to 8192, or multiples
+    of 16 up to 16384. This is an inference API for finite inputs.
+    """
+    if input.ndim != 2:
+        raise ValueError("input must be a 2D tensor")
+    norm = torch.empty(input.shape, device=input.device, dtype=torch.bfloat16)
+    quant = torch.empty(input.shape, device=input.device, dtype=torch.int8)
+    scales = torch.empty((input.shape[0], 1), device=input.device, dtype=torch.float32)
+    if residual is None and input.dtype == torch.float32:
+        residual_result = input
+        residual_output = None
+    else:
+        residual_result = torch.empty(
+            input.shape, device=input.device, dtype=torch.float32
+        )
+        residual_output = residual_result
+    op.gemma_rms_norm_per_token_int8_quant_out(
+        norm,
+        quant,
+        scales,
+        input,
+        weight,
+        epsilon,
+        residual,
+        residual_output,
+    )
+    return norm, quant, scales, residual_result

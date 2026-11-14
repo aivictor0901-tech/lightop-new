@@ -1589,3 +1589,208 @@ void mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang(
 }
 
 }}
+
+// Gemma residual/RMSNorm producer for mixed BF16/INT8 consumers.  Keep the
+// activation-dtype round trip before computing the INT8 row scale.
+namespace at {
+namespace native {
+
+template <typename scalar_t, int Vec, int block_size, bool has_residual>
+__global__
+__launch_bounds__(block_size) void gemma_rms_norm_per_token_int8_quant_kernel(
+    const scalar_t* input, const float* residual, const float* weight,
+    c10::BFloat16* norm, int8_t* quant, float* scales, float* residual_output, int cols,
+    float epsilon) {
+  using InputVec = at::native::memory::aligned_vector<scalar_t, Vec>;
+  using FloatVec = at::native::memory::aligned_vector<float, Vec>;
+  using NormVec = at::native::memory::aligned_vector<c10::BFloat16, Vec>;
+  using QuantVec = at::native::memory::aligned_vector<int8_t, Vec>;
+  constexpr int shared_size = block_size / C10_WARP_SIZE;
+  __shared__ float reduction[shared_size];
+  __shared__ float row_rstd;
+  __shared__ float row_absmax;
+
+  const int tid = threadIdx.x;
+  const int64_t offset = static_cast<int64_t>(blockIdx.x) * cols + tid * Vec;
+  const bool active = tid < cols / Vec;
+  FloatVec values;
+  FloatVec weights;
+  float square_sum = 0.0f;
+  if (active) {
+    const InputVec x = *reinterpret_cast<const InputVec*>(input + offset);
+    FloatVec r;
+    if constexpr (has_residual) {
+      r = *reinterpret_cast<const FloatVec*>(residual + offset);
+    }
+    weights = *reinterpret_cast<const FloatVec*>(weight + tid * Vec);
+#pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+      float value = static_cast<float>(x.val[i]);
+      if constexpr (has_residual) {
+        value += r.val[i];
+      }
+      values.val[i] = value;
+      square_sum += value * value;
+    }
+    if (residual_output != nullptr) {
+      *reinterpret_cast<FloatVec*>(residual_output + offset) = values;
+    }
+  }
+  square_sum = BlockReduceSum_ROW<float, block_size>(square_sum, reduction);
+  if (tid == 0) {
+    row_rstd = c10::cuda::compat::rsqrt(square_sum / cols + epsilon);
+  }
+  __syncthreads();
+
+  NormVec normalized;
+  float absmax = 0.0f;
+  if (active) {
+#pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+      const float gamma = weights.val[i] + 1.0f;
+      normalized.val[i] = c10::BFloat16(values.val[i] * row_rstd * gamma);
+      absmax = fmaxf(absmax, fabsf(static_cast<float>(normalized.val[i])));
+    }
+  }
+  absmax = BlockReduceMax_ROW<float, block_size>(absmax, reduction);
+  if (tid == 0) {
+    row_absmax = fmaxf(absmax, 1.0e-10f);
+    scales[blockIdx.x] = row_absmax / 127.0f;
+  }
+  __syncthreads();
+
+  if (active) {
+    const float inverse_scale = 127.0f / row_absmax;
+    QuantVec quantized;
+#pragma unroll
+    for (int i = 0; i < Vec; ++i) {
+      quantized.val[i] =
+          float_to_int8_rn(static_cast<float>(normalized.val[i]) * inverse_scale);
+    }
+    *reinterpret_cast<NormVec*>(norm + offset) = normalized;
+    *reinterpret_cast<QuantVec*>(quant + offset) = quantized;
+  }
+}
+
+template <typename scalar_t, int Vec, int block_size>
+void launch_gemma_rms_norm_per_token_int8_quant(
+    const Tensor& input, const Tensor& weight, Tensor& norm, Tensor& quant,
+    Tensor& scales, double epsilon, const std::optional<Tensor>& residual,
+    const std::optional<Tensor>& residual_output, cudaStream_t stream) {
+  const int rows = input.numel() / input.size(-1);
+  const int cols = input.size(-1);
+  const float* r = residual ? residual->data_ptr<float>() : nullptr;
+  float* r_out = residual_output ? residual_output->data_ptr<float>() : nullptr;
+  if (residual) {
+    gemma_rms_norm_per_token_int8_quant_kernel<scalar_t, Vec, block_size, true>
+        <<<rows, block_size, 0, stream>>>(
+            input.data_ptr<scalar_t>(), r, weight.data_ptr<float>(),
+            norm.data_ptr<c10::BFloat16>(), quant.data_ptr<int8_t>(),
+            scales.data_ptr<float>(), r_out, cols, static_cast<float>(epsilon));
+  } else {
+    gemma_rms_norm_per_token_int8_quant_kernel<scalar_t, Vec, block_size, false>
+        <<<rows, block_size, 0, stream>>>(
+            input.data_ptr<scalar_t>(), r, weight.data_ptr<float>(),
+            norm.data_ptr<c10::BFloat16>(), quant.data_ptr<int8_t>(),
+            scales.data_ptr<float>(), r_out, cols, static_cast<float>(epsilon));
+  }
+}
+
+void gemma_rms_norm_per_token_int8_quant_out(Tensor& norm, Tensor& quant,
+                                             Tensor& scales, const Tensor& input,
+                                             const Tensor& weight, double epsilon,
+                                             std::optional<Tensor> residual,
+                                             std::optional<Tensor> residual_output) {
+  TORCH_CHECK(input.is_cuda() && input.dim() == 2, "input must be a 2D GPU tensor");
+  TORCH_CHECK(input.scalar_type() == at::kFloat || input.scalar_type() == at::kBFloat16,
+              "input must have dtype torch.float32 or torch.bfloat16");
+  const int64_t cols = input.size(-1);
+  TORCH_CHECK(cols > 0 && cols <= 16384 && cols % 8 == 0,
+              "hidden size must be a positive multiple of 8, at most 16384");
+  TORCH_CHECK(cols <= 8192 || cols % 16 == 0,
+              "hidden sizes above 8192 must be divisible by 16");
+  TORCH_CHECK(std::isfinite(epsilon) && epsilon >= 0.0,
+              "epsilon must be finite and non-negative");
+  TORCH_CHECK(
+      weight.dim() == 1 && weight.numel() == cols && weight.scalar_type() == at::kFloat,
+      "weight must be an FP32 vector matching the hidden size");
+  TORCH_CHECK(norm.sizes() == input.sizes() && norm.scalar_type() == at::kBFloat16,
+              "norm must match input shape and have dtype torch.bfloat16");
+  TORCH_CHECK(quant.sizes() == input.sizes() && quant.scalar_type() == at::kChar,
+              "quant must match input shape and have dtype torch.int8");
+  TORCH_CHECK(scales.scalar_type() == at::kFloat && scales.dim() == 2 &&
+                  scales.size(0) == input.size(0) && scales.size(1) == 1,
+              "scales must be FP32 with shape [rows, 1]");
+  std::vector<Tensor> tensors = {input, weight, norm, quant, scales};
+  if (residual) {
+    TORCH_CHECK(
+        residual->sizes() == input.sizes() && residual->scalar_type() == at::kFloat,
+        "residual must be FP32 and match input shape");
+    TORCH_CHECK(residual_output.has_value(),
+                "residual_output is required when residual is provided");
+    tensors.push_back(*residual);
+  }
+  if (residual_output) {
+    TORCH_CHECK(residual_output->sizes() == input.sizes() &&
+                    residual_output->scalar_type() == at::kFloat,
+                "residual_output must be FP32 and match input shape");
+    tensors.push_back(*residual_output);
+  }
+  for (const auto& tensor : tensors) {
+    TORCH_CHECK(tensor.device() == input.device(),
+                "all tensors must be on the same GPU");
+    TORCH_CHECK(tensor.is_contiguous(), "all tensors must be contiguous");
+  }
+  const int vec = cols > 8192 ? 16 : 8;
+  for (const auto& tensor : tensors) {
+    const size_t alignment =
+        tensor.is_same(scales) ? sizeof(float) : vec * tensor.element_size();
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0,
+                "tensor storage must satisfy vector-load alignment");
+  }
+  std::vector<Tensor> outputs = {norm, quant, scales};
+  if (residual_output) outputs.push_back(*residual_output);
+  for (size_t i = 0; i < outputs.size(); ++i) {
+    TORCH_CHECK(!tensors_overlap(outputs[i], input) &&
+                    !tensors_overlap(outputs[i], weight) &&
+                    (!residual || !tensors_overlap(outputs[i], *residual)),
+                "outputs must not overlap input, weight, or residual");
+    for (size_t j = 0; j < i; ++j) {
+      TORCH_CHECK(!tensors_overlap(outputs[i], outputs[j]),
+                  "outputs must not overlap each other");
+    }
+  }
+  if (input.size(0) == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#define LAUNCH_GEMMA_NORM_INT8(TYPE, VEC, THREADS)                \
+  launch_gemma_rms_norm_per_token_int8_quant<TYPE, VEC, THREADS>( \
+      input, weight, norm, quant, scales, epsilon, residual, residual_output, stream)
+#define DISPATCH_GEMMA_NORM_INT8(TYPE)        \
+  do {                                        \
+    if (cols <= 512) {                        \
+      LAUNCH_GEMMA_NORM_INT8(TYPE, 8, 64);    \
+    } else if (cols <= 1024) {                \
+      LAUNCH_GEMMA_NORM_INT8(TYPE, 8, 128);   \
+    } else if (cols <= 2048) {                \
+      LAUNCH_GEMMA_NORM_INT8(TYPE, 8, 256);   \
+    } else if (cols <= 4096) {                \
+      LAUNCH_GEMMA_NORM_INT8(TYPE, 8, 512);   \
+    } else if (cols <= 8192) {                \
+      LAUNCH_GEMMA_NORM_INT8(TYPE, 8, 1024);  \
+    } else {                                  \
+      LAUNCH_GEMMA_NORM_INT8(TYPE, 16, 1024); \
+    }                                         \
+  } while (false)
+  if (input.scalar_type() == at::kFloat) {
+    DISPATCH_GEMMA_NORM_INT8(float);
+  } else {
+    DISPATCH_GEMMA_NORM_INT8(c10::BFloat16);
+  }
+#undef DISPATCH_GEMMA_NORM_INT8
+#undef LAUNCH_GEMMA_NORM_INT8
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+}  // namespace native
+}  // namespace at

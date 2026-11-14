@@ -19,6 +19,7 @@ EXISTING_NORM_APIS = [
     "fused_rms_norm_contiguous",
     "gemma_fused_add_rmsnorm",
     "gemma_rms_norm_per_token_fp8_quant",
+    "gemma_rms_norm_per_token_int8_quant",
     "gemma_rmsnorm",
     "GroupNorm",
     "LayerNorm",

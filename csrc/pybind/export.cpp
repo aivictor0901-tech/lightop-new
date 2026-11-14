@@ -529,6 +529,10 @@ void blockwise_scaled_cast_transpose(const Tensor& input,std::optional<Tensor> o
                                     const int block_len,const int block_scaling_dim,const bool rowwise,const bool columnwise,
                                     const float epsilon,const bool pow2_scale,const bool all_gather_usage, at::ScalarType out_dtype);
 
+void gemma_rms_norm_per_token_int8_quant_out(
+    Tensor& norm, Tensor& quant, Tensor& scales, const Tensor& input,
+    const Tensor& weight, double epsilon, std::optional<Tensor> residual,
+    std::optional<Tensor> residual_output);
 void rms_norm_dynamic_per_token_quant(Tensor &output,Tensor& input,const Tensor& weight,Tensor scales,double epsilon,std::optional<Tensor> residual,bool update_input,double limit);
 void rms_norm_dynamic_per_token_quant_sglang(Tensor &output,Tensor& input,const Tensor& weight,Tensor scales,double epsilon,std::optional<Tensor> residual,bool update_input,double limit,std::optional<Tensor> smooth_scale,std::optional<Tensor> norm_output,bool clamp_norm_output,std::optional<Tensor> residual_output,std::optional<Tensor> clamped_output);
 void mla_qkv_a_rms_norm_dynamic_per_token_quant_sglang(Tensor& q_out,Tensor& packed_input,const Tensor& q_weight,const Tensor& kv_weight,
@@ -1420,6 +1424,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("awq_marlin_repack", &at::native::awq_marlin_repack, "awq_marlin_repack");
   m.def("awq_marlin_repack_w4a8", &at::native::awq_marlin_repack_w4a8, "awq_marlin_repack_w4a8");
   m.def("blockwise_scaled_cast_transpose", &at::native::blockwise_scaled_cast_transpose, "blockwise_scaled_cast_transpose");
+  m.def("gemma_rms_norm_per_token_int8_quant_out",
+        &at::native::gemma_rms_norm_per_token_int8_quant_out,
+        "Gemma residual/RMSNorm with BF16-rounded per-token INT8 quantization",
+        py::arg("norm"), py::arg("quant"), py::arg("scales"),
+        py::arg("input"), py::arg("weight"), py::arg("epsilon"),
+        py::arg("residual") = py::none(), py::arg("residual_output") = py::none());
+
   m.def(
       "rms_norm_dynamic_per_token_quant",
       &at::native::rms_norm_dynamic_per_token_quant,
