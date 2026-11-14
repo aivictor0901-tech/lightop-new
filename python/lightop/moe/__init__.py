@@ -24,6 +24,7 @@ from .expert_parallel import (
     ep_gather,
     ep_scatter,
     ep_permute_int8_small,
+    shared_gateup_int8_epilogue,
 )
 from .gemm import (
     moe_gemm_w16a16,
@@ -85,6 +86,7 @@ def __getattr__(name):
 
 __all__ = [
     "ep_permute_int8_small",
+    "shared_gateup_int8_epilogue",
     "bf16_router_gemm",
     "bf16_mega_gate_hcu",
     "ep_build_m_indices",

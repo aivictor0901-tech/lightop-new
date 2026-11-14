@@ -616,6 +616,10 @@ void ep_scatter(torch::Tensor aq,torch::Tensor aq_scale,torch::Tensor topk_ids,t
 std::vector<torch::Tensor> ep_permute_int8_small(
     const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
     const torch::Tensor&, int64_t, int64_t, std::optional<torch::Tensor>);
+std::vector<torch::Tensor> shared_gateup_int8_epilogue(
+    const torch::Tensor&, std::optional<torch::Tensor>,
+    std::optional<torch::Tensor>, int64_t, double,
+    std::optional<torch::Tensor>, std::optional<torch::Tensor>);
 
 void destindex_copy_quantize_int8_cuda(const torch::Tensor& input, torch::Tensor& scale_zero, torch::Tensor& output);
 void destindex_dequantize_int8_cuda(const torch::Tensor& input, const torch::Tensor& scale_zero, torch::Tensor& output);
@@ -1738,6 +1742,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("input"), py::arg("scales"), py::arg("topk_ids"), py::arg("expert_map"),
         py::arg("local_experts"), py::arg("alignment") = 128,
         py::arg("output") = std::nullopt);
+  m.def("shared_gateup_int8_epilogue", &at::native::shared_gateup_int8_epilogue,
+        py::arg("partials"), py::arg("xscale") = std::nullopt,
+        py::arg("wscale") = std::nullopt, py::arg("router_columns") = 352,
+        py::arg("limit") = 7.0, py::arg("output") = std::nullopt,
+        py::arg("output_scales") = std::nullopt);
   m.def("destindex_copy_quantize_int8_cuda", &at::native::destindex_copy_quantize_int8_cuda, "destindex_copy_quantize_int8_cuda");
   m.def("destindex_dequantize_int8_cuda", &at::native::destindex_dequantize_int8_cuda, "destindex_dequantize_int8_cuda");
   m.def("kimi_k2_moe_fused_gate", &at::native::kimi_k2_moe_fused_gate, "kimi_k2_moe_fused_gate");

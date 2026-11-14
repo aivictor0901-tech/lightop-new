@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/native/cuda/MemoryAccess.cuh>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <torch/all.h>
 
 #include <algorithm>
@@ -18,6 +20,169 @@
 
 namespace at {
 namespace native {
+
+namespace {
+// Two waves per row for every M, with one vector4 per active lane.
+// Parallelize the full384-wide activation without splitting its output scale.
+__global__ __launch_bounds__(128) void shared_gateup_int8_epilogue_kernel(
+    const void* input, const float* xscale, const float* wscale, int8_t* output,
+    float* scales, int rows, int router_tiles, float limit, bool split_k) {
+#pragma clang fp contract(off)
+  const int tid = threadIdx.x, lane = tid % 64, wave = tid / 64, row = blockIdx.x,
+            col = tid * 4;
+  const int num_m = (rows + 31) / 32, tiles = (router_tiles + 6) * num_m;
+  using IVec = at::native::memory::aligned_vector<int32_t, 4>;
+  using FVec = at::native::memory::aligned_vector<float, 4>;
+  using QVec = at::native::memory::aligned_vector<int8_t, 4>;
+  using BVec = at::native::memory::aligned_vector<c10::BFloat16, 4>;
+  __shared__ float maxima[2];
+  float values[4]{}, maximum = 0.f;
+  if (col < 384) {
+    FVec gate, up;
+    if (split_k) {
+      const auto* partials = static_cast<const int32_t*>(input);
+      const int pid = (router_tiles + col / 64) * num_m + row / 32;
+      const int base = pid * 4096 + (row % 32) * 64 + col % 64;
+      IVec g{}, u{};
+#pragma unroll
+      for (int split = 0; split < 4; ++split) {
+        const IVec gp =
+            *reinterpret_cast<const IVec*>(partials + split * tiles * 4096 + base);
+        const IVec upart = *reinterpret_cast<const IVec*>(
+            partials + split * tiles * 4096 + base + 2048);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          g.val[j] += gp.val[j];
+          u.val[j] += upart.val[j];
+        }
+      }
+      const float xs = xscale[row];
+      const FVec gw = *reinterpret_cast<const FVec*>(wscale + col);
+      const FVec uw = *reinterpret_cast<const FVec*>(wscale + 384 + col);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        gate.val[j] = float(c10::BFloat16(float(g.val[j]) * (xs * gw.val[j])));
+        up.val[j] = float(c10::BFloat16(float(u.val[j]) * (xs * uw.val[j])));
+      }
+    } else {
+      const auto* gateup =
+          static_cast<const c10::BFloat16*>(input) + int64_t(row) * 768;
+      const BVec g = *reinterpret_cast<const BVec*>(gateup + col);
+      const BVec u = *reinterpret_cast<const BVec*>(gateup + 384 + col);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        gate.val[j] = float(g.val[j]);
+        up.val[j] = float(u.val[j]);
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float gf = gate.val[j], uf = up.val[j];
+      const float activated = gf * (1.f / (1.f + __expf(-gf)));
+      const float y = float(
+          c10::BFloat16(fminf(activated, limit) * fminf(fmaxf(uf, -limit), limit)));
+      values[j] = y;
+      maximum = fmaxf(maximum, fabsf(y));
+    }
+  }
+#pragma unroll
+  for (int d = 32; d; d >>= 1) maximum = fmaxf(maximum, __shfl_xor(maximum, d, 64));
+  if (lane == 0) maxima[wave] = maximum;
+  __syncthreads();
+  const float scale = fmaxf(fmaxf(maxima[0], maxima[1]), 1.e-10f) * (1.f / 127.f);
+  if (tid == 0) scales[row] = scale;
+  if (col < 384) {
+    QVec quant;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float q = nearbyintf(__fdiv_rn(values[j], scale));
+      quant.val[j] = static_cast<int8_t>(fminf(127.f, fmaxf(-127.f, q)));
+    }
+    *reinterpret_cast<QVec*>(output + int64_t(row) * 384 + col) = quant;
+  }
+}
+}  // namespace
+
+std::vector<torch::Tensor> shared_gateup_int8_epilogue(
+    const torch::Tensor& input, std::optional<torch::Tensor> xscale,
+    std::optional<torch::Tensor> wscale, int64_t router_columns, double limit,
+    std::optional<torch::Tensor> output, std::optional<torch::Tensor> output_scales) {
+  TORCH_CHECK(
+      input.is_cuda() && input.is_contiguous() &&
+          (input.scalar_type() == at::kInt || input.scalar_type() == at::kBFloat16),
+      "expected contiguous INT32 split-K workspace or BF16 gate/up[M,768]");
+  TORCH_CHECK(
+      router_columns > 0 && router_columns <= 4096 && std::isfinite(limit) && limit > 0,
+      "invalid router width or activation limit");
+  const bool split_k = input.scalar_type() == at::kInt;
+  const int router_tiles = (router_columns + 63) / 64;
+  int64_t rows;
+  if (split_k) {
+    TORCH_CHECK(xscale.has_value() && wscale.has_value(),
+                "INT32 workspace requires token and channel scales");
+    TORCH_CHECK(xscale->scalar_type() == at::kFloat && xscale->dim() == 2 &&
+                    xscale->size(1) == 1 && xscale->is_contiguous(),
+                "expected FP32 token scales[M,1]");
+    TORCH_CHECK(wscale->scalar_type() == at::kFloat && wscale->numel() == 768 &&
+                    wscale->is_contiguous(),
+                "expected768 FP32 gate/up channel scales");
+    TORCH_CHECK(
+        xscale->device() == input.device() && wscale->device() == input.device(),
+        "all inputs must share a CUDA device");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(wscale->data_ptr()) % 16 == 0,
+                "expected16-byte-aligned channel scales");
+    rows = xscale->size(0);
+    const int64_t required = 4 * ((rows + 31) / 32) * (router_tiles + 6) * 4096;
+    TORCH_CHECK(required <= std::numeric_limits<int32_t>::max(),
+                "split-K workspace exceeds INT32 indexing");
+    TORCH_CHECK(input.numel() >= required, "insufficient split-K workspace");
+  } else {
+    TORCH_CHECK(input.dim() == 2 && input.size(1) == 768,
+                "expected BF16 gate/up[M,768]");
+    TORCH_CHECK(!xscale.has_value() && !wscale.has_value(),
+                "BF16 gate/up is already scaled");
+    rows = input.size(0);
+  }
+  TORCH_CHECK(rows <= 65536 && reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0,
+              "expected at most65536 aligned input rows");
+  const c10::cuda::CUDAGuard guard(input.device());
+  auto q = output.has_value()
+               ? *output
+               : torch::empty({rows, 384}, input.options().dtype(at::kChar));
+  auto s = output_scales.has_value()
+               ? *output_scales
+               : torch::empty({rows, 1}, input.options().dtype(at::kFloat));
+  TORCH_CHECK(q.device() == input.device() && q.scalar_type() == at::kChar &&
+                  q.is_contiguous() && q.dim() == 2 && q.size(0) == rows &&
+                  q.size(1) == 384,
+              "invalid INT8 output");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr()) % 4 == 0,
+              "expected4-byte-aligned INT8 output");
+  TORCH_CHECK(s.device() == input.device() && s.scalar_type() == at::kFloat &&
+                  s.is_contiguous() && s.dim() == 2 && s.size(0) == rows &&
+                  s.size(1) == 1,
+              "invalid scale output");
+  at::assert_no_overlap(input, q);
+  at::assert_no_overlap(input, s);
+  at::assert_no_overlap(q, s);
+  if (split_k) {
+    at::assert_no_overlap(*xscale, q);
+    at::assert_no_overlap(*xscale, s);
+    at::assert_no_overlap(*wscale, q);
+    at::assert_no_overlap(*wscale, s);
+  }
+  if (rows) {
+    TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->warpSize == 64,
+                "wave64 device required");
+    shared_gateup_int8_epilogue_kernel<<<rows, 128, 0,
+                                         at::cuda::getCurrentCUDAStream()>>>(
+        input.data_ptr(), split_k ? xscale->data_ptr<float>() : nullptr,
+        split_k ? wscale->data_ptr<float>() : nullptr, q.data_ptr<int8_t>(),
+        s.data_ptr<float>(), rows, router_tiles, limit, split_k);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return {q, s};
+}
 
 #define LIGHTOP_DISPATCH_CASE_FLOATING_TYPES(...)       \
   AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__)  \
