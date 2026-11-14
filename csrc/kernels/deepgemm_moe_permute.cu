@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/Atomic.cuh>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -19,6 +22,161 @@ namespace native {
 
 constexpr int EP_SCAN_MAX_EXPERTS = 1024;
 constexpr int EP_MAX_TOPK = 16;
+
+namespace {
+// Fixed per-expert metadata and vectorized gather for every batch. The
+// offset calculation stays in metadata so gather has no reduction or barrier.
+template <typename Id>
+__device__ __forceinline__ int ep_small_local_expert(Id raw, const int32_t* mapping,
+                                                     int map_size, int local_experts) {
+  const int64_t gid = static_cast<int64_t>(raw);
+  if (gid < 0 || gid >= map_size) return -1;
+  const int e = mapping[gid];
+  return e >= 0 && e < local_experts ? e : -1;
+}
+
+template <typename Id>
+__global__ __launch_bounds__(512) void ep_small_stable_metadata_kernel(
+    const Id* ids, const int32_t* mapping, Id* inverse, int32_t* experts, int routes,
+    int map_size, int local_experts, int alignment, int bound) {
+  __shared__ int groups[32], histogram[64], start;
+  const int tid = threadIdx.x, lane = tid % 64, wave = tid / 64, expert = blockIdx.x;
+  if (tid < 64) histogram[tid] = 0;
+  if (tid < 32) groups[tid] = 0;
+  unsigned int own = 0;
+  unsigned long long ranks = 0;
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    if (j * 512 >= routes) continue;
+    const int route = j * 512 + tid;
+    const int local = route < routes ? ep_small_local_expert(ids[route], mapping,
+                                                             map_size, local_experts)
+                                     : -1;
+    if (local >= 0) atomicAdd(histogram + local, 1);
+    const bool mine = local == expert;
+    const unsigned long long mask = __ballot(mine);
+    const int rank = __popcll(mask & ((1ull << lane) - 1));
+    own |= unsigned(mine) << j;
+    ranks |= static_cast<unsigned long long>(rank) << (j * 6);
+    if (lane == 0) groups[j * 8 + wave] = __popcll(mask);
+    if (expert == local_experts && route < routes && local < 0) inverse[route] = -1;
+  }
+  __syncthreads();
+  if (tid < 64) {
+    const int count = lane < 32 ? groups[lane] : 0;
+    int inclusive = count;
+#pragma unroll
+    for (int shift = 1; shift < 64; shift *= 2) {
+      const int previous = __shfl_up(inclusive, shift, 64);
+      if (lane >= shift) inclusive += previous;
+    }
+    if (lane < 32) groups[lane] = inclusive - count;
+    int prefix = lane < expert && lane < local_experts
+                     ? ((histogram[lane] + alignment - 1) & (-alignment))
+                     : 0;
+#pragma unroll
+    for (int d = 32; d; d >>= 1) prefix += __shfl_xor(prefix, d, 64);
+    if (lane == 0) start = prefix;
+  }
+  __syncthreads();
+  if (expert < local_experts) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      if ((own >> j) & 1) {
+        const int destination =
+            start + groups[j * 8 + wave] + ((ranks >> (j * 6)) & 63);
+        inverse[j * 512 + tid] = destination;
+        experts[destination] = expert;
+      }
+    }
+    const int count = histogram[expert],
+              end = start + ((count + alignment - 1) & (-alignment));
+    for (int pos = start + count + tid; pos < end; pos += 512) experts[pos] = -1;
+  } else {
+    for (int pos = start + tid; pos < bound; pos += 512) experts[pos] = -1;
+  }
+}
+
+template <typename Id>
+__global__ __launch_bounds__(256) void ep_small_int8_gather_kernel(
+    const int8_t* input, const float* scales, const Id* inverse, int8_t* output,
+    float* output_scales, int width, int topk) {
+  const int route = blockIdx.x;
+  const int64_t destination = static_cast<int64_t>(inverse[route]);
+  if (destination < 0) return;
+  const int token = route / topk;
+  using Vec = uint4;
+  for (int col = threadIdx.x * 16; col < width; col += 256 * 16)
+    *reinterpret_cast<Vec*>(output + destination * width + col) =
+        *reinterpret_cast<const Vec*>(input + int64_t(token) * width + col);
+  if (threadIdx.x == 0) output_scales[destination] = scales[token];
+}
+}  // namespace
+
+std::vector<torch::Tensor> ep_permute_int8_small(
+    const torch::Tensor& input, const torch::Tensor& scales,
+    const torch::Tensor& topk_ids, const torch::Tensor& expert_map,
+    int64_t local_experts, int64_t alignment, std::optional<torch::Tensor> output) {
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == at::kChar && input.dim() == 2 &&
+                  input.is_contiguous() && input.size(1) % 16 == 0,
+              "expected contiguous INT8 input[M,K], K%16=0");
+  TORCH_CHECK(scales.scalar_type() == at::kFloat && scales.is_contiguous() &&
+                  scales.numel() == input.size(0),
+              "expected one FP32 scale per token");
+  TORCH_CHECK(
+      topk_ids.dim() == 2 && topk_ids.size(0) == input.size(0) &&
+          topk_ids.is_contiguous() &&
+          (topk_ids.scalar_type() == at::kInt || topk_ids.scalar_type() == at::kLong) &&
+          topk_ids.size(1) > 0 && topk_ids.numel() <= 2048,
+      "expected <=2048 INT32/INT64 routes");
+  TORCH_CHECK(expert_map.scalar_type() == at::kInt && expert_map.dim() == 1 &&
+                  expert_map.is_contiguous() && local_experts > 0 &&
+                  local_experts <= 64 && (alignment == 64 || alignment == 128),
+              "invalid expert map/alignment");
+  TORCH_CHECK(scales.device() == input.device() &&
+                  topk_ids.device() == input.device() &&
+                  expert_map.device() == input.device(),
+              "all inputs must share a CUDA device");
+  const int64_t routes = topk_ids.numel(), k = input.size(1);
+  const int64_t bound =
+      ((routes + std::min(routes, local_experts) * (alignment - 1) + alignment - 1) /
+       alignment) *
+      alignment;
+  auto gathered =
+      output.has_value() ? *output : torch::empty({bound, k}, input.options());
+  TORCH_CHECK(gathered.device() == input.device() &&
+                  gathered.scalar_type() == at::kChar && gathered.is_contiguous() &&
+                  gathered.dim() == 2 && gathered.size(0) == bound &&
+                  gathered.size(1) == k,
+              "gather output shape/capacity mismatch");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(gathered.data_ptr()) % 16 == 0,
+              "expected16-byte-aligned INT8 input and gather output");
+  at::assert_no_overlap(input, gathered);
+  at::assert_no_overlap(scales, gathered);
+  at::assert_no_overlap(topk_ids, gathered);
+  at::assert_no_overlap(expert_map, gathered);
+  auto gs = torch::empty({bound, 1}, scales.options());
+  auto indices = torch::empty({bound}, expert_map.options());
+  auto inverse = torch::empty_like(topk_ids);
+  if (!routes) return {gathered, gs, indices, inverse};
+  const c10::cuda::CUDAGuard guard(input.device());
+  TORCH_CHECK(at::cuda::getCurrentDeviceProperties()->warpSize == 64,
+              "wave64 device required");
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "ep_permute_int8_small", [&] {
+    ep_small_stable_metadata_kernel<index_t><<<local_experts + 1, 512, 0, stream>>>(
+        topk_ids.data_ptr<index_t>(), expert_map.data_ptr<int32_t>(),
+        inverse.data_ptr<index_t>(), indices.data_ptr<int32_t>(), routes,
+        expert_map.numel(), local_experts, alignment, bound);
+    ep_small_int8_gather_kernel<index_t><<<routes, 256, 0, stream>>>(
+        input.data_ptr<int8_t>(), scales.data_ptr<float>(), inverse.data_ptr<index_t>(),
+        gathered.data_ptr<int8_t>(), gs.data_ptr<float>(), k, topk_ids.size(1));
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {gathered, gs, indices, inverse};
+}
 
 template <typename TopKType>
 static inline __device__ bool ep_resolve_local_expert(

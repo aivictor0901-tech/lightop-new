@@ -19,7 +19,12 @@ from .config import (
     get_moe_groupgemm_config_w4a8,
     get_moe_groupgemm_marlin_config_w4a8,
 )
-from .expert_parallel import ep_build_m_indices, ep_gather, ep_scatter
+from .expert_parallel import (
+    ep_build_m_indices,
+    ep_gather,
+    ep_scatter,
+    ep_permute_int8_small,
+)
 from .gemm import (
     moe_gemm_w16a16,
     moe_gemm_w4a8,
@@ -79,6 +84,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    "ep_permute_int8_small",
     "bf16_router_gemm",
     "bf16_mega_gate_hcu",
     "ep_build_m_indices",

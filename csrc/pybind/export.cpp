@@ -613,6 +613,9 @@ void rms_rotary_embedding_fuse(Tensor &positions,Tensor &query,Tensor &key,int64
 void reshape_and_cache_cuda(torch::Tensor& key,torch::Tensor& value, torch::Tensor& key_cache, torch::Tensor& value_cache, torch::Tensor& slot_mapping, const std::string& kv_cache_dtype, torch::Tensor& k_scale, torch::Tensor& v_scale);
 void ep_fused_quant_scatter(torch::Tensor input,torch::Tensor topk_ids,torch::optional<torch::Tensor> expert_map_opt,torch::Tensor expert_num_tokens,torch::Tensor aq_out,torch::Tensor aq_scale_out,torch::Tensor m_indices,torch::Tensor inv_perm, int local_num_experts,int alignment);
 void ep_scatter(torch::Tensor aq,torch::Tensor aq_scale,torch::Tensor topk_ids,torch::optional<torch::Tensor> expert_map_opt, torch::Tensor expert_num_tokens,torch::Tensor aq_out,torch::Tensor aq_scale_out,torch::optional<torch::Tensor> m_indices_opt,torch::Tensor inv_perm,int local_num_experts,int alignment);
+std::vector<torch::Tensor> ep_permute_int8_small(
+    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+    const torch::Tensor&, int64_t, int64_t, std::optional<torch::Tensor>);
 
 void destindex_copy_quantize_int8_cuda(const torch::Tensor& input, torch::Tensor& scale_zero, torch::Tensor& output);
 void destindex_dequantize_int8_cuda(const torch::Tensor& input, const torch::Tensor& scale_zero, torch::Tensor& output);
@@ -1731,6 +1734,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("reshape_and_cache_cuda", &at::native::reshape_and_cache_cuda,"reshape_and_cache_cuda");
   m.def("ep_fused_quant_scatter", &at::native::ep_fused_quant_scatter,"ep_fused_quant_scatter");
   m.def("ep_scatter", &at::native::ep_scatter,"ep_scatter");
+  m.def("ep_permute_int8_small", &at::native::ep_permute_int8_small,
+        py::arg("input"), py::arg("scales"), py::arg("topk_ids"), py::arg("expert_map"),
+        py::arg("local_experts"), py::arg("alignment") = 128,
+        py::arg("output") = std::nullopt);
   m.def("destindex_copy_quantize_int8_cuda", &at::native::destindex_copy_quantize_int8_cuda, "destindex_copy_quantize_int8_cuda");
   m.def("destindex_dequantize_int8_cuda", &at::native::destindex_dequantize_int8_cuda, "destindex_dequantize_int8_cuda");
   m.def("kimi_k2_moe_fused_gate", &at::native::kimi_k2_moe_fused_gate, "kimi_k2_moe_fused_gate");
