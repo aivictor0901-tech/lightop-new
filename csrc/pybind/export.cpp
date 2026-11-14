@@ -1639,6 +1639,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("candidate_query_lens") = std::nullopt);
   m.attr("_fp8_fp4_mqa_logits_supports_candidates") = true;
   m.def("paged_mqa_logits", &lightop::deep_gemm::paged_mqa_logits,"paged_mqa_logits");
+
+  m.def("spec_indexer_logits", &lightop::deep_gemm::spec_indexer_logits,
+        py::arg("q"), py::arg("summary"), py::arg("block_table"), py::arg("weights"),
+        py::arg("nscore"), py::arg("query_start_loc"), py::arg("out"),
+        py::arg("weight_scale") = 1.0);
   m.def("paged_mqa_logits_persisten", &lightop::deep_gemm::paged_mqa_logits_persisten,
         "dense persistent paged MQA logits with per-request KV reuse",
         py::arg("q"), py::arg("fused_kv_cache"), py::arg("weights"),

@@ -17,6 +17,32 @@ from ..gemmopt import (
 )
 
 
+def spec_indexer_logits(
+    q, summary, block_table, weights, nscore, query_start_loc, out, weight_scale=1.0
+):
+    """Page8 FP8 indexer scores for up to four queries per request.
+
+    Q is pre-rounded E4M3 in BF16 [T,1,4,256]; weights are BF16 [T,1,4]
+    with row stride divisible by4. nscore[T] and query_start_loc[R+1] are int32,
+    and each request owns zero through four consecutive query rows.
+    summary is contiguous E4M3 [physical_rows,1,256], with eight rows/page.
+    Preserve ReLU, weight multiplication and ordered head summation in FP32.
+    Caller-owned out[T,width] is written only where key < nscore[token].
+    Metadata values must be in range; no device-to-host scan is performed.
+    Q/summary/weights require32/16/8-byte alignment. Output must not alias
+    inputs or itself. All batch sizes use the same four-wave implementation
+    on gfx938. Other MQA implementations and defaults are unchanged.
+    """
+    from .. import op
+
+    if not hasattr(op, "spec_indexer_logits"):
+        raise RuntimeError("spec_indexer_logits requires a rebuilt LightOp extension")
+    op.spec_indexer_logits(
+        q, summary, block_table, weights, nscore, query_start_loc, out, weight_scale
+    )
+    return out
+
+
 def get_paged_mqa_logits_fp4_metadata(
     context_lens, block_kv, num_sms, rows_per_request=1
 ):

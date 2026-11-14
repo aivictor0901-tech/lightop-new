@@ -12,6 +12,7 @@ from ..minimax_qk_norm_rope import minimax_qk_norm_rope, supports_minimax_qk_nor
 from ..dsv4_prefill import dsv41_rope_fake_quant_store
 from .mhc import mhc_repeat_cp_sglang, supports_mhc_repeat_cp_sglang
 from .mqa import (
+    spec_indexer_logits,
     fp8_fp4_paged_sparse_mqa_logits,
     prefill_sparse_mqa_fused,
     sparse_fp8_fp4_paged_mqa_logits,
@@ -75,6 +76,7 @@ from .rope import (
 )
 
 __all__ = [
+    "spec_indexer_logits",
     "minimax_qk_norm_rope",
     "supports_minimax_qk_norm_rope",
     "fp8_fp4_paged_sparse_mqa_logits",
