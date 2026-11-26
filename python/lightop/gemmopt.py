@@ -10,6 +10,7 @@ import os
 import math
 from .config_smooth_gemm import (
     _W8A8_SMOOTH_GFX936_CACHED_ALGOS,
+    _W8A8_SMOOTH_GFX936_TUNED,
     gemm_w8a8_smooth_config,
 )
 from .config_deepgemm import gemm_w8a8_deepgemm_masked_config
@@ -83,6 +84,47 @@ def isNOt_exist_co_dir():
         return True
     return False
 
+@functools.lru_cache(maxsize=None)
+def _is_smooth_gfx936_80cu(device):
+    properties = torch.cuda.get_device_properties(device)
+    return (getattr(properties, "gcnArchName", "").split(":")[0] == "gfx936"
+            and properties.multi_processor_count == 80)
+
+
+def _try_tuned_w8a8_smooth(a, b, scale_a, scale_b, bias, out_dtype):
+    """Return a measured result, or None to continue the existing dispatch."""
+    if (a.ndim != 2 or b.ndim != 2 or not a.is_cuda
+            or a.dtype != torch.int8 or b.dtype != torch.int8
+            or out_dtype != torch.bfloat16 or bias is not None):
+        return None
+    m, k = a.shape
+    n = b.shape[1]
+    selected = _W8A8_SMOOTH_GFX936_TUNED.get((m, k, n))
+    if (selected is None or b.shape[0] != k or not a.is_contiguous()
+            or b.stride() != (1, k)
+            or scale_a.shape != (m, 1) or scale_b.shape != (n, 1)
+            or scale_a.dtype != torch.float32 or scale_b.dtype != torch.float32
+            or not scale_a.is_contiguous() or not scale_b.is_contiguous()
+            or any(t.device != a.device or t.storage_offset() != 0
+                   or t.data_ptr() % 16 for t in (a, b, scale_a, scale_b))
+            or not _is_smooth_gfx936_80cu(a.device)):
+        return None
+    kind, setting = selected
+    if kind == "blaslt":
+        if _int8_blaslt_scaled_mm is None:
+            return None
+        return _int8_blaslt_scaled_mm(a, b, scale_a, scale_b, setting)
+    if kind == "asm":
+        if isNOt_exist_co_dir():
+            return None
+        return op.gemm_w8a8_smooth_asm(
+            a, b, scale_a, scale_b, bias, out_dtype, m, n, k, True, setting)
+    if kind == "small":
+        return op.gemm_w8_a8_smooth_colmajor(
+            a, b, scale_a, scale_b, bias, out_dtype, *setting)
+    raise ValueError("Unknown measured Smooth GEMM backend: " + kind)
+
+
 def gemm_w8a8_smooth(a, b, scale_a, scale_b, bias, out_dtype, *,
                      input_scale_first=False):
     """Channel INT8 GEMM returning ``(supported, output)``.
@@ -125,6 +167,11 @@ def gemm_w8a8_smooth(a, b, scale_a, scale_b, bias, out_dtype, *,
         # scale association. The opt-in object retains the original WGM8 body.
         output = op.gemm_w8a8_smooth_asm(
             a, b, scale_a, scale_b, bias, out_dtype, m, n, k, False, 8, True)
+        return True, output
+    # The measured table preserves (scale_a * scale_b) * INT32 accumulation.
+    # input_scale_first has already returned above and cannot enter this path.
+    output = _try_tuned_w8a8_smooth(a, b, scale_a, scale_b, bias, out_dtype)
+    if output is not None:
         return True, output
     # Diagnostic isolation: preserve every other optimized GEMM route.
     if (m, k, n) == (32, 2304, 5120):
